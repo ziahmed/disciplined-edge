@@ -1,0 +1,297 @@
+"""
+Disciplined Edge — ML service entrypoint.
+
+    cd services/ml
+    uvicorn app.main:app --reload --port 8000
+
+GET  /          -> preview page: prediction card + market-movers board
+GET  /health
+GET  /docs
+GET  /movers    -> top 5 gainers/losers (today & weekly), NASDAQ & SGX, cached
+POST /predict
+"""
+
+from datetime import datetime, timezone
+
+from fastapi import FastAPI, HTTPException
+from fastapi.responses import HTMLResponse
+
+from app.routers import predict
+
+app = FastAPI(title="Disciplined Edge ML", version="0.1.0")
+app.include_router(predict.router)
+
+
+@app.get("/health")
+def health() -> dict:
+    return {"status": "ok"}
+
+
+# ════════════════════════════════════════════════════════════════════
+#  MARKET MOVERS — top 5 gainers / losers among a tracked universe.
+#  HONEST SCOPE: this ranks movers WITHIN these tracked names, NOT the
+#  entire exchange. Pure price movement — nothing to do with the model.
+#  Dead/unknown tickers are skipped, not crashed on.
+# ════════════════════════════════════════════════════════════════════
+NASDAQ_UNIVERSE = {
+    "AAPL": "Apple", "MSFT": "Microsoft", "NVDA": "NVIDIA", "AMZN": "Amazon",
+    "GOOGL": "Alphabet", "META": "Meta", "AVGO": "Broadcom", "TSLA": "Tesla",
+    "AMD": "AMD", "INTC": "Intel", "QCOM": "Qualcomm", "MU": "Micron",
+    "AMAT": "Applied Materials", "ASML": "ASML", "ADBE": "Adobe", "CRM": "Salesforce",
+    "NFLX": "Netflix", "CSCO": "Cisco", "INTU": "Intuit", "PYPL": "PayPal",
+    "PEP": "PepsiCo", "COST": "Costco", "TMUS": "T-Mobile", "AMGN": "Amgen",
+    "GILD": "Gilead", "SBUX": "Starbucks", "MDLZ": "Mondelez", "ABNB": "Airbnb",
+    "PLTR": "Palantir", "IONQ": "IonQ",
+}
+SGX_UNIVERSE = {
+    "D05.SI": "DBS", "O39.SI": "OCBC", "U11.SI": "UOB", "Z74.SI": "Singtel",
+    "C6L.SI": "SIA", "C38U.SI": "CapitaLand Int. Comm.", "A17U.SI": "Ascendas REIT",
+    "J69U.SI": "Frasers Cpt Trust", "BN4.SI": "Keppel", "F34.SI": "Wilmar",
+    "C07.SI": "Jardine C&C", "U96.SI": "Sembcorp", "S58.SI": "SATS",
+    "G13.SI": "Genting Sing", "Y92.SI": "Thai Beverage", "BS6.SI": "Yangzijiang",
+    "S63.SI": "ST Engineering", "C09.SI": "City Developments", "S68.SI": "SGX",
+    "M44U.SI": "Mapletree Log", "H78.SI": "Hongkong Land", "BUOU.SI": "Frasers L&C",
+}
+
+_MOVERS_CACHE: dict = {}
+
+
+def _compute_movers(universe: dict) -> dict:
+    import yfinance as yf
+    import pandas as pd
+
+    syms = list(universe.keys())
+    raw = yf.download(syms, period="1mo", auto_adjust=True, progress=False)
+    if raw is None or raw.empty:
+        raise HTTPException(503, detail={"error": "data_unavailable",
+                            "detail": "Could not fetch market data. Try refresh."})
+    closes = raw["Close"] if "Close" in raw.columns.get_level_values(0) else raw
+
+    rows, skipped = [], []
+    for sym in syms:
+        try:
+            s = closes[sym].dropna()
+        except Exception:
+            skipped.append(sym); continue
+        if len(s) < 2:
+            skipped.append(sym); continue
+        last = float(s.iloc[-1])
+        today = (s.iloc[-1] / s.iloc[-2] - 1) * 100
+        weekly = (s.iloc[-1] / s.iloc[-6] - 1) * 100 if len(s) >= 6 else None
+        rows.append({
+            "symbol": sym, "name": universe[sym], "last": round(last, 2),
+            "today": round(float(today), 2),
+            "weekly": round(float(weekly), 2) if weekly is not None else None,
+        })
+
+    def top(key, reverse):
+        valid = [r for r in rows if r[key] is not None]
+        return sorted(valid, key=lambda r: r[key], reverse=reverse)[:5]
+
+    return {
+        "today":  {"gainers": top("today", True),  "losers": top("today", False)},
+        "weekly": {"gainers": top("weekly", True), "losers": top("weekly", False)},
+        "skipped": skipped,
+        "tracked": len(rows),
+    }
+
+
+@app.get("/movers")
+def movers(refresh: bool = False) -> dict:
+    if refresh or "data" not in _MOVERS_CACHE:
+        nasdaq = _compute_movers(NASDAQ_UNIVERSE)
+        sgx = _compute_movers(SGX_UNIVERSE)
+        _MOVERS_CACHE["data"] = {
+            "nasdaq": nasdaq, "sgx": sgx,
+            "as_of": datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC"),
+        }
+    return _MOVERS_CACHE["data"]
+
+
+_PREVIEW_PAGE = """<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>Disciplined Edge</title>
+<style>
+  :root { --bg:#0f1420; --card:#1a2235; --ink:#e8edf7; --muted:#8b97ad;
+          --accent:#5b8def; --band:#5b8def33; --band2:#5b8def66; --warn:#f0a85c;
+          --up:#4cc38a; --down:#e5707e; }
+  * { box-sizing: border-box; }
+  body { margin:0; background:var(--bg); color:var(--ink);
+         font-family: system-ui, -apple-system, Segoe UI, Roboto, sans-serif; }
+  .wrap { max-width: 760px; margin: 0 auto; padding: 32px 20px 64px; }
+  h1 { font-size: 22px; margin: 0 0 4px; }
+  h2 { font-size: 17px; margin: 36px 0 4px; }
+  .sub { color: var(--muted); font-size: 14px; margin: 0 0 20px; }
+  .controls { display:flex; gap:10px; flex-wrap:wrap; align-items:flex-end; margin-bottom:20px; }
+  label { display:block; font-size:12px; color:var(--muted); margin-bottom:4px; }
+  input, select, button { font-size:14px; padding:9px 12px; border-radius:8px;
+                   border:1px solid #2c3854; background:var(--card); color:var(--ink); }
+  input { text-transform:uppercase; width:130px; }
+  button { background:var(--accent); border:none; cursor:pointer; font-weight:600; }
+  button:hover { filter:brightness(1.08); }
+  button.ghost { background:transparent; border:1px solid #2c3854; font-weight:500; }
+  button.ghost.on { background:#2c3854; }
+  .card { background:var(--card); border:1px solid #2c3854; border-radius:14px; padding:22px; }
+  .big { font-size:34px; font-weight:700; margin:2px 0; }
+  .row { display:flex; gap:24px; flex-wrap:wrap; margin-top:8px; }
+  .stat .k { font-size:12px; color:var(--muted); }
+  .stat .v { font-size:18px; font-weight:600; }
+  .bandwrap { margin:26px 0 8px; }
+  .track { position:relative; height:46px; border-radius:8px; background:var(--band); }
+  .inner { position:absolute; top:0; bottom:0; background:var(--band2); border-radius:6px; }
+  .marker { position:absolute; top:-6px; bottom:-6px; width:3px; background:var(--ink); }
+  .ends { display:flex; justify-content:space-between; font-size:12px; color:var(--muted); margin-top:6px; }
+  .factors { margin-top:20px; }
+  .factor { border-top:1px solid #2c3854; padding:12px 0; }
+  .factor .name { font-weight:600; font-size:14px; }
+  .factor .exp { color:var(--muted); font-size:13px; margin-top:3px; }
+  .err { color:#f08c8c; }
+  .hint { color:var(--muted); font-size:12px; margin-top:18px; line-height:1.5; }
+  /* movers */
+  .mv-controls { display:flex; gap:8px; align-items:center; margin:10px 0 16px; }
+  .panels { display:flex; gap:16px; flex-wrap:wrap; }
+  .panel { background:var(--card); border:1px solid #2c3854; border-radius:14px;
+           padding:16px 18px; flex:1; min-width:300px; }
+  .panel h3 { margin:0 0 10px; font-size:15px; }
+  .mv-sub { font-size:12px; color:var(--muted); margin:12px 0 6px; text-transform:uppercase; letter-spacing:.04em; }
+  .mv-row { display:flex; justify-content:space-between; align-items:baseline;
+            padding:6px 0; border-top:1px solid #232d44; font-size:14px; }
+  .mv-row .nm { color:var(--ink); }
+  .mv-row .tk { color:var(--muted); font-size:12px; margin-left:6px; }
+  .mv-row .pc { font-weight:600; }
+  .up { color:var(--up); } .down { color:var(--down); }
+</style>
+</head>
+<body>
+<div class="wrap">
+  <h1>Disciplined Edge</h1>
+  <p class="sub">Type any NASDAQ or SGX ticker (SGX uses codes like D05.SI).</p>
+
+  <div class="controls">
+    <div><label for="symbol">Ticker</label>
+      <input id="symbol" value="ASML" maxlength="10" autocomplete="off" spellcheck="false" /></div>
+    <div><label for="horizon">Horizon</label>
+      <select id="horizon">
+        <option value="1w" selected>Next-day</option>
+        <option value="1m">1 month</option>
+        <option value="3m">3 months</option>
+        <option value="6m">6 months</option>
+        <option value="1y">1 year</option>
+      </select></div>
+    <button id="go">Get prediction</button>
+  </div>
+  <div id="out" class="card" style="display:none"></div>
+  <div id="loading" class="sub" style="display:none">Training model (walk-forward) &mdash; first view can take 1.5-3 min&hellip;</div>
+
+  <h2>Market movers</h2>
+  <p class="sub" style="margin-bottom:0">Top 5 up / down among tracked names &mdash; price movement only, not predictions. Not the whole exchange.</p>
+  <div class="mv-controls">
+    <button class="ghost on" id="tog-today">Today</button>
+    <button class="ghost" id="tog-weekly">Weekly</button>
+    <button id="refresh" style="margin-left:auto">Refresh</button>
+  </div>
+  <div class="panels">
+    <div class="panel" id="panel-nasdaq"><h3>NASDAQ</h3><div class="mv-body sub">Loading&hellip;</div></div>
+    <div class="panel" id="panel-sgx"><h3>SGX (Singapore)</h3><div class="mv-body sub">Loading&hellip;</div></div>
+  </div>
+  <p class="hint" id="mv-note"></p>
+</div>
+
+<script>
+function money(n){ return Number(n).toLocaleString(undefined,{maximumFractionDigits:2}); }
+function pct(v, lo, hi){ return ((v - lo) / (hi - lo)) * 100; }
+
+/* ---- prediction card (unchanged behaviour) ---- */
+async function getPrediction(){
+  const symbol=(document.getElementById('symbol').value||'').trim().toUpperCase();
+  const horizon=document.getElementById('horizon').value;
+  const out=document.getElementById('out'), loading=document.getElementById('loading');
+  if(!symbol){ out.innerHTML='<p class="err">Enter a ticker symbol.</p>'; out.style.display='block'; return; }
+  out.style.display='none'; loading.style.display='block';
+  try{
+    const res=await fetch('/predict',{method:'POST',headers:{'Content-Type':'application/json'},
+      body:JSON.stringify({symbol,exchange:'NASDAQ',horizon})});
+    loading.style.display='none';
+    if(!res.ok){ const e=await res.json().catch(()=>({}));
+      out.innerHTML='<p class="err">'+((e.detail&&e.detail.detail)||('Error '+res.status))+'</p>';
+      out.style.display='block'; return; }
+    const p=await res.json();
+    const lo=p.intervals.ci95[0],hi=p.intervals.ci95[1];
+    const i68lo=pct(p.intervals.ci68[0],lo,hi), i68w=pct(p.intervals.ci68[1],lo,hi)-i68lo, mk=pct(p.point_target,lo,hi);
+    out.innerHTML=
+      '<div class="stat"><div class="k">Base case ('+p.symbol+', '+p.horizon+')</div><div class="big">'+money(p.point_target)+'</div></div>'+
+      '<div class="row"><div class="stat"><div class="k">Chance higher</div><div class="v">'+Math.round(p.prob_up*100)+'%</div></div>'+
+      '<div class="stat"><div class="k">Forecast volatility</div><div class="v">'+(p.risk.vol_forecast*100).toFixed(1)+'%</div></div>'+
+      '<div class="stat"><div class="k">Value at risk (95%)</div><div class="v">'+(p.risk.var_95*100).toFixed(1)+'%</div></div></div>'+
+      '<div class="bandwrap"><div class="k" style="font-size:12px;color:var(--muted);margin-bottom:6px">Likely range &mdash; darker band = more likely (68%), full bar = 95%</div>'+
+      '<div class="track"><div class="inner" style="left:'+i68lo+'%;width:'+i68w+'%"></div><div class="marker" style="left:'+mk+'%"></div></div>'+
+      '<div class="ends"><span>'+money(lo)+'</span><span>'+money(hi)+'</span></div></div>'+
+      '<div class="factors">'+p.factors.map(function(f){return '<div class="factor"><div class="name">'+f.factor+'</div><div class="exp">'+f.explanation+'</div></div>';}).join('')+'</div>';
+    out.style.display='block';
+  }catch(err){ loading.style.display='none';
+    out.innerHTML='<p class="err">Could not reach the server. Is uvicorn still running?</p>'; out.style.display='block'; }
+}
+document.getElementById('go').addEventListener('click',getPrediction);
+document.getElementById('symbol').addEventListener('keydown',function(e){ if(e.key==='Enter') getPrediction(); });
+
+/* ---- market movers ---- */
+let MOVERS=null, PERIOD='today';
+function moverRows(list){
+  if(!list||!list.length) return '<div class="sub" style="padding:6px 0">No data.</div>';
+  return list.map(function(m){
+    const v=m[PERIOD]; if(v===null||v===undefined) return '';
+    const cls=v>=0?'up':'down', sign=v>=0?'+':'';
+    return '<div class="mv-row"><span><span class="nm">'+m.name+'</span><span class="tk">'+m.symbol+'</span></span>'+
+           '<span class="pc '+cls+'">'+sign+v.toFixed(2)+'%</span></div>';
+  }).join('');
+}
+function renderPanel(id, data){
+  const el=document.querySelector('#'+id+' .mv-body');
+  const g=data[PERIOD].gainers, l=data[PERIOD].losers;
+  el.innerHTML='<div class="mv-sub up">Top gainers</div>'+moverRows(g)+
+               '<div class="mv-sub down">Top losers</div>'+moverRows(l);
+}
+function renderMovers(){
+  if(!MOVERS) return;
+  renderPanel('panel-nasdaq', MOVERS.nasdaq);
+  renderPanel('panel-sgx', MOVERS.sgx);
+  const sk=(MOVERS.nasdaq.skipped||[]).concat(MOVERS.sgx.skipped||[]);
+  document.getElementById('mv-note').innerHTML=
+    'As of '+MOVERS.as_of+'. Tracking '+(MOVERS.nasdaq.tracked+MOVERS.sgx.tracked)+' names.'+
+    (sk.length? ' Skipped (no data): '+sk.join(', ')+'.' : '');
+}
+async function loadMovers(refresh){
+  document.querySelectorAll('.mv-body').forEach(function(e){ e.innerHTML='<div class="sub" style="padding:6px 0">Loading market data (first load ~1 min)&hellip;</div>'; });
+  try{
+    const res=await fetch('/movers'+(refresh?'?refresh=true':''));
+    if(!res.ok){ throw new Error('status '+res.status); }
+    MOVERS=await res.json(); renderMovers();
+  }catch(err){
+    document.querySelectorAll('.mv-body').forEach(function(e){ e.innerHTML='<div class="err" style="padding:6px 0">Could not load movers. Try Refresh.</div>'; });
+  }
+}
+function setPeriod(p){
+  PERIOD=p;
+  document.getElementById('tog-today').classList.toggle('on', p==='today');
+  document.getElementById('tog-weekly').classList.toggle('on', p==='weekly');
+  renderMovers();
+}
+document.getElementById('tog-today').addEventListener('click',function(){ setPeriod('today'); });
+document.getElementById('tog-weekly').addEventListener('click',function(){ setPeriod('weekly'); });
+document.getElementById('refresh').addEventListener('click',function(){ loadMovers(true); });
+
+/* initial load */
+getPrediction();
+loadMovers(false);
+</script>
+</body>
+</html>
+"""
+
+
+@app.get("/", response_class=HTMLResponse)
+def preview() -> str:
+    return _PREVIEW_PAGE

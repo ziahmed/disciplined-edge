@@ -1,0 +1,10 @@
+fastapi>=0.111
+uvicorn[standard]>=0.30
+pydantic>=2.7
+numpy>=2.0,<2.3
+pandas>=2.0
+scikit-learn>=1.4
+xgboost>=2.0
+# yfinance / shap / torch added as the pipeline and Phase 3 land
+httpx>=0.27
+pytest>=8.0

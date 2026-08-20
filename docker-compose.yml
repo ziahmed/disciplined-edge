@@ -1,0 +1,16 @@
+# Local dev dependencies: Postgres+TimescaleDB and Redis.
+# Run: docker compose up -d  (then apply infra/migrations/0001_init.sql)
+services:
+  db:
+    image: timescale/timescaledb:latest-pg16
+    environment:
+      POSTGRES_USER: dev
+      POSTGRES_PASSWORD: dev
+      POSTGRES_DB: disciplined_edge
+    ports: ["5432:5432"]
+    volumes: ["dbdata:/var/lib/postgresql/data"]
+  redis:
+    image: redis:7
+    ports: ["6379:6379"]
+volumes:
+  dbdata:

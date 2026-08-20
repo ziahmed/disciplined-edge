@@ -1,0 +1,8 @@
+Username
+student-03-280a6a48ff9e@qwiklabs.net
+
+Password
+W857VGXxhb69
+
+Project ID
+qwiklabs-gcp-02-68d4859ca57d

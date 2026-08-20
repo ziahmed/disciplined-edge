@@ -1,0 +1,14 @@
+{
+  "name": "@disciplined-edge/mobile",
+  "version": "0.1.0",
+  "private": true,
+  "scripts": { "start": "expo start" },
+  "dependencies": {
+    "@disciplined-edge/types": "workspace:*",
+    "expo": "~51.0.0",
+    "expo-local-authentication": "~14.0.0",
+    "expo-secure-store": "~13.0.0",
+    "react": "^18.3.0",
+    "react-native": "0.74.0"
+  }
+}
