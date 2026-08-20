@@ -3,23 +3,18 @@ import { z } from "zod";
 /**
  * Prediction contract — conformant copy of docs/api-contract.md.
  * If this drifts from the Markdown contract, the contract test fails.
- *
- * This is imported by apps/web, apps/mobile, and apps/api. There is no
- * code path in any of them that can render a price target without a band,
- * because `intervals` and `probUp` are required here.
  */
-
 export const Exchange = z.enum(["NASDAQ", "SGX"]);
 export type Exchange = z.infer<typeof Exchange>;
 
-export const Horizon = z.enum(["1w", "1m", "3m", "6m", "1y"]);
+export const Horizon = z.enum(["1d", "1w", "1m", "3m", "6m", "1y"]);
 export type Horizon = z.infer<typeof Horizon>;
 
 export const PredictRequest = z.object({
   symbol: z.string().min(1),
   exchange: Exchange,
   horizon: Horizon,
-  asOf: z.string().date().optional(),
+  as_of: z.string().date().optional(),
 });
 export type PredictRequest = z.infer<typeof PredictRequest>;
 
@@ -38,28 +33,27 @@ export const Prediction = z
     symbol: z.string(),
     exchange: Exchange,
     horizon: Horizon,
-    generatedAt: z.string().datetime(),
-    modelVersion: z.string(),
-    pointTarget: z.number(),
+    generated_at: z.string().datetime(),
+    model_version: z.string(),
+    point_target: z.number(),
     intervals: z.object({
       ci68: Interval,
       ci95: Interval,
     }),
-    probUp: z.number().min(0).max(1),
+    prob_up: z.number().min(0).max(1),
     scenarios: z.object({
       bull: z.number(),
       base: z.number(),
       bear: z.number(),
     }),
     risk: z.object({
-      var95: z.number(),
-      volForecast: z.number().min(0),
+      var_95: z.number(),
+      vol_forecast: z.number().min(0),
     }),
     factors: z.array(Factor).min(1).max(5),
   })
-  // Invariants from the contract, enforced at parse time.
-  .refine((p) => p.intervals.ci68[0] <= p.pointTarget && p.pointTarget <= p.intervals.ci68[1], {
-    message: "pointTarget must lie inside the 68% interval",
+  .refine((p) => p.intervals.ci68[0] <= p.point_target && p.point_target <= p.intervals.ci68[1], {
+    message: "point_target must lie inside the 68% interval",
   })
   .refine(
     (p) => p.intervals.ci95[0] <= p.intervals.ci68[0] && p.intervals.ci95[1] >= p.intervals.ci68[1],
@@ -68,11 +62,10 @@ export const Prediction = z
   .refine((p) => p.scenarios.bear <= p.scenarios.base && p.scenarios.base <= p.scenarios.bull, {
     message: "scenarios must satisfy bear <= base <= bull",
   });
-
 export type Prediction = z.infer<typeof Prediction>;
 
 export const PredictError = z.object({
-  error: z.enum(["unknown_symbol", "insufficient_history", "model_unavailable"]),
+  error: z.enum(["unknown_symbol", "insufficient_history", "model_unavailable", "ticker_not_found", "empty_symbol"]),
   detail: z.string().optional(),
 });
 export type PredictError = z.infer<typeof PredictError>;
